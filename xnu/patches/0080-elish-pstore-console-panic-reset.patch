@@ -1,0 +1,384 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..462bb4e 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_pstore.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_pstore.c b/bsd/dev/sweet_pstore.c
+new file mode 100644
+index 0000000..668bdf0
+--- /dev/null
++++ b/bsd/dev/sweet_pstore.c
+@@ -0,0 +1,244 @@
++/*
++ * elish (Xiaomi Pad 5 Pro, SM8250) boot diagnostics for the SWEET kernel.
++ *
++ * - Console mirror into the Linux ramoops console zone (boot-arg
++ *   elishpstore, default 1): LineageOS reads it back after the next boot as
++ *   /sys/fs/pstore/console-ramoops-0, so every kernel line and panic
++ *   survives a warm reset. The zone (0xb0000000 + 2 MiB, persistent_ram_buffer
++ *   layout, no ECC) lies in DDR bank R0, outside the RAM xnu manages. The
++ *   shim's own log is kept: the kernel text is appended behind it.
++ * - Warm reset (PSCI SYSTEM_RESET2) at the end of a panic, after
++ *   elishpanicwait seconds (default 15) so the screen can be read, and for
++ *   every restart request; SYSTEM_OFF for halt.
++ * - bsd_init stage trace (elishtrace, default 1) and a watchdog thread:
++ *   an "alive" line every elishbeat seconds (default 30) and a panic, hence
++ *   a reset with the log saved, after elishstall seconds (default 120,
++ *   0 = off) without other console output before bsd_init is done.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/startup.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <machine/atomic.h>
++#include <stdarg.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++extern uint64_t sweet_log_position(void);
++
++#define PSTORE_PA               0xb0000000ULL
++#define PSTORE_SIZE             0x200000ULL
++#define PSTORE_SIG              0x43474244u     /* "DBGC", Linux PERSISTENT_RAM_SIG */
++
++#define PSCI_SYSTEM_OFF         0x84000008ULL
++#define PSCI_SYSTEM_RESET       0x84000009ULL
++#define PSCI_FEATURES           0x8400000aULL
++#define PSCI_SYSTEM_RESET2      0xc4000012ULL
++
++struct pstore_buffer {
++	volatile uint32_t sig;
++	volatile uint32_t start;        /* next write offset */
++	volatile uint32_t size;         /* valid bytes */
++	volatile uint8_t data[];
++};
++
++static struct pstore_buffer *_Atomic pstore;
++static uint32_t pstore_cap;
++static uint64_t pstore_base;            /* bytes of the shim log kept in front */
++
++/* Console bytes [at, at + size) of sweet_log_append's stream; any context. */
++void sweet_pstore_append(const char *c, int size, uint64_t at);
++
++void
++sweet_pstore_append(const char *c, int size, uint64_t at)
++{
++	struct pstore_buffer *p = os_atomic_load(&pstore, acquire);
++	if (p == NULL || size <= 0) {
++		return;
++	}
++	uint64_t pos = pstore_base + at;
++	for (int i = 0; i < size; i++) {
++		p->data[(pos + (uint64_t)i) % pstore_cap] = (uint8_t)c[i];
++	}
++	uint64_t end = pos + (uint64_t)size;
++	p->start = (uint32_t)(end % pstore_cap);
++	p->size = end >= pstore_cap ? pstore_cap : (uint32_t)end;
++}
++
++__startup_func
++static void
++sweet_pstore_init(void)
++{
++	uint32_t on = 1;
++	PE_parse_boot_argn("elishpstore", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	vm_offset_t va = ml_io_map((vm_offset_t)PSTORE_PA, (vm_size_t)PSTORE_SIZE);
++	if (va == 0) {
++		return;
++	}
++	struct pstore_buffer *p = (struct pstore_buffer *)va;
++	pstore_cap = (uint32_t)PSTORE_SIZE - (uint32_t)sizeof(struct pstore_buffer);
++	/* Keep a short, unwrapped log (the shim's) in front of the kernel's. */
++	pstore_base = 0;
++	if (p->sig == PSTORE_SIG && p->size == p->start && p->size < pstore_cap / 4) {
++		pstore_base = p->size;
++	} else {
++		p->start = 0;
++		p->size = 0;
++		p->sig = PSTORE_SIG;
++	}
++	/* New console bytes go straight in from here on; copy what came before. */
++	os_atomic_store(&pstore, p, release);
++	uint64_t pos = 0, total = sweet_log_position();
++	char buf[256];
++	while (pos < total) {
++		/* sweet_log_copy may skip ahead; the chunk always ends at the new pos */
++		uint32_t n = sweet_log_copy(&pos, buf, (uint32_t)MIN((uint64_t)sizeof(buf), total - pos));
++		if (n == 0) {
++			break;
++		}
++		sweet_pstore_append(buf, (int)n, pos - n);
++	}
++	printf("ELISH PSTORE: console mirrored to %#llx + %#llx (after %llu bytes of shim log)\n",
++	    PSTORE_PA, PSTORE_SIZE, pstore_base);
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_FIRST, sweet_pstore_init);
++
++/* SMCCC 1.0: x0 is the signed result; do not assume x1-x17 survive. */
++static int64_t
++sweet_psci(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int64_t)x0;
++}
++
++static void
++sweet_spin_seconds(uint32_t secs)
++{
++	uint64_t interval, end;
++	nanoseconds_to_absolutetime((uint64_t)secs * NSEC_PER_SEC, &interval);
++	end = mach_absolute_time() + interval;
++	while (mach_absolute_time() < end) {
++		/* plain spin: interrupts are off here and WFE may never wake */
++	}
++}
++
++/*
++ * Called by SweetPlatformExpert::haltRestart. how: 0 halt, 1 restart,
++ * 2 end of a panic. Does not return unless PSCI refuses.
++ */
++void sweet_pstore_reset(int how);
++
++void
++sweet_pstore_reset(int how)
++{
++	if (how == 2) {
++		uint32_t wait = 15;
++		PE_parse_boot_argn("elishpanicwait", &wait, sizeof(wait));
++		printf("ELISH: warm reset in %u s (log in pstore)\n", wait);
++		sweet_spin_seconds(wait);
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (how == 0) {
++		sweet_psci(PSCI_SYSTEM_OFF, 0, 0, 0);
++	}
++	if (sweet_psci(PSCI_FEATURES, PSCI_SYSTEM_RESET2, 0, 0) >= 0) {
++		sweet_psci(PSCI_SYSTEM_RESET2, 0, 0, 0);       /* SYSTEM_WARM_RESET: DRAM kept */
++	}
++	sweet_psci(PSCI_SYSTEM_RESET, 0, 0, 0);
++}
++
++/* --- bsd_init stage trace and boot watchdog --- */
++static char sweet_stage_text[96] = "(before bsd_init)";
++static uint64_t _Atomic sweet_watch_own;        /* console bytes the watchdog wrote itself */
++static int sweet_trace = -1;
++
++void sweet_stage(const char *fmt, ...) __printflike(1, 2);
++
++void
++sweet_stage(const char *fmt, ...)
++{
++	va_list ap;
++	va_start(ap, fmt);
++	vsnprintf(sweet_stage_text, sizeof(sweet_stage_text), fmt, ap);
++	va_end(ap);
++	size_t n = strlen(sweet_stage_text);
++	if (n && sweet_stage_text[n - 1] == '\n') {
++		sweet_stage_text[n - 1] = 0;
++	}
++	if (sweet_trace < 0) {
++		uint32_t on = 1;
++		PE_parse_boot_argn("elishtrace", &on, sizeof(on));
++		sweet_trace = on != 0;
++	}
++	if (sweet_trace) {
++		printf("ELISH STAGE %s\n", sweet_stage_text);
++	}
++}
++
++static int sweet_watch_chan;
++static bool _Atomic sweet_watch_stop;          /* never set yet; keeps the loop finite for the compiler */
++
++static void
++sweet_watch_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t beat = 30, stall = 120;
++	PE_parse_boot_argn("elishbeat", &beat, sizeof(beat));
++	PE_parse_boot_argn("elishstall", &stall, sizeof(stall));
++	if (beat == 0 || beat > 600) {
++		beat = 30;
++	}
++	uint64_t t0 = mach_absolute_time(), last_out = 0, quiet_since = t0;
++	while (!os_atomic_load(&sweet_watch_stop, relaxed)) {
++		uint64_t deadline;
++		clock_interval_to_deadline(beat, NSEC_PER_SEC, &deadline);
++		assert_wait_deadline(&sweet_watch_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++
++		uint64_t now = mach_absolute_time(), ns, quiet_ns;
++		uint64_t out = sweet_log_position() - os_atomic_load(&sweet_watch_own, relaxed);
++		if (out != last_out) {
++			last_out = out;
++			quiet_since = now;
++		}
++		absolutetime_to_nanoseconds(now - t0, &ns);
++		absolutetime_to_nanoseconds(now - quiet_since, &quiet_ns);
++		bool done = strncmp(sweet_stage_text, "bsd_init: done", 14) == 0;
++		uint64_t before = sweet_log_position();
++		printf("ELISH: alive +%llus, quiet %llus, stage: %s\n", ns / NSEC_PER_SEC,
++		    quiet_ns / NSEC_PER_SEC, sweet_stage_text);
++		os_atomic_add(&sweet_watch_own, sweet_log_position() - before, relaxed);
++		if (stall && !done && quiet_ns / NSEC_PER_SEC >= stall) {
++			panic("ELISH: no console output for %llu s, last stage: %s",
++			    quiet_ns / NSEC_PER_SEC, sweet_stage_text);
++		}
++	}
++}
++
++/* From SweetPlatformExpert::start (threads and IOKit are up). */
++void sweet_watch_start(void);
++
++void
++sweet_watch_start(void)
++{
++	thread_t thread;
++	if (kernel_thread_start(sweet_watch_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..c270c7e 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -356,7 +356,10 @@ ufs_find_partition(const char *want)
+ static int
+ ufs_take_over_host(void)
+ {
+-	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
++	uint32_t hce = ufs_rd(REG_HCE);
++	printf("SWEET UFS: HCE 0x%x\n", hce);    /* a hang before this line: host clocks off */
++	uint32_t hcs = ufs_rd(REG_HCS);
++	printf("SWEET UFS: HCS 0x%x CAP 0x%x UTRLDBR 0x%x\n", hcs, ufs_rd(REG_CAP), ufs_rd(REG_UTRLDBR));
+ 	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
+ 		printf("SWEET UFS: host not ready (hce 0x%x hcs 0x%x)\n", hce, hcs);
+ 		return ENXIO;
+@@ -607,6 +610,7 @@ sweet_ufs_init(void)
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
+ 
++	printf("SWEET UFS: init: host at %#lx + %#lx, root \"%s\"\n", reg[0], reg[1], want);
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+@@ -618,6 +622,7 @@ sweet_ufs_init(void)
+ 		return ENOMEM;
+ 	}
+ 	su.dma_pa = ptoa_64(pn);
++	printf("SWEET UFS: DMA at 0x%llx; reading host registers\n", su.dma_pa);
+ 	su.lun = 0;
+ 	su.secsize = DEV_BSIZE;
+ 
+@@ -687,6 +692,7 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+ 
+ /* Called for all console output, any context: never blocks. */
+ void sweet_log_append(const char *c, int size);
++extern void sweet_pstore_append(const char *c, int size, uint64_t at);  /* sweet_pstore.c */
+ 
+ void
+ sweet_log_append(const char *c, int size)
+@@ -698,6 +704,7 @@ sweet_log_append(const char *c, int size)
+ 	for (int i = 0; i < size; i++) {
+ 		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
+ 	}
++	sweet_pstore_append(c, size, at);
+ }
+ 
+ /*
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..3e634f9 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -494,6 +494,10 @@ bsd_init(void)
+ 
+ #if DEBUG_BSDINIT
+ #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
++#elif defined(ARM64_BOARD_CONFIG_SWEET)
++/* elish: every stage on the console (elishtrace=0 off) and for the boot watchdog (sweet_pstore.c) */
++extern void sweet_stage(const char *fmt, ...) __printflike(1, 2);
++#define bsd_init_kprintf(x, ...) sweet_stage("bsd_init: " x, ## __VA_ARGS__)
+ #else
+ #define bsd_init_kprintf(x, ...)
+ #endif
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..bae6222 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -15,6 +15,7 @@ class SweetPlatformExpert : public IODTPlatformExpert {
+ 
+ public:
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	int haltRestart(unsigned int type) APPLE_KEXT_OVERRIDE;
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
+@@ -22,6 +23,9 @@ public:
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++extern "C" void sweet_pstore_reset(int how);   /* bsd/dev/sweet_pstore.c */
++extern "C" void sweet_watch_start(void);
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
+@@ -31,9 +35,36 @@ SweetPlatformExpert::start(IOService *provider)
+ 	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
++	sweet_watch_start();
+ 	return true;
+ }
+ 
++/*
++ * No PMU: PSCI does it. A panic ends here with kPEPanicDiagnosticsDone
++ * (and kPEPanicRestartCPU when it asks for a restart): warm reset after a
++ * pause, so the console log survives in pstore.
++ */
++int
++SweetPlatformExpert::haltRestart(unsigned int type)
++{
++	switch (type) {
++	case kPEPanicDiagnosticsDone:
++	case kPEPanicRestartCPU:
++	case kPEPanicRestartCPUNoCallouts:
++		sweet_pstore_reset(2);
++		break;
++	case kPERestartCPU:
++		sweet_pstore_reset(1);
++		break;
++	case kPEHaltCPU:
++		sweet_pstore_reset(0);
++		break;
++	default:
++		break;
++	}
++	return IODTPlatformExpert::haltRestart(type);
++}
++
+ const char *
+ SweetPlatformExpert::deleteList(void)
+ {
