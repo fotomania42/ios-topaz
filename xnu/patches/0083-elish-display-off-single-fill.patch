@@ -1,0 +1,51 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -17,9 +17,9 @@
+  *      +0x104 enabled layer mask
+  *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h],
+  *   12 RequestPowerChange [state]: 0 = display off (backboardd, power
+- *      button / auto-lock), else on. Off fades the panel out over a few
+- *      vsyncs (halving each pixel) and keeps it black until on again;
+- *      the panel itself stays powered (AMOLED black pixels are off).
++ *      button / auto-lock), else on. Off fills the panel black once and
++ *      keeps it black until on again; the panel itself stays powered
++ *      (AMOLED black pixels are off; on elish's LCD the backlight stays on).
+  *   18 IsMainDisplay,
+  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
+  * Everything else is accepted and logged once.
+@@ -226,17 +226,27 @@
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fPowerOff) {
+-		/* Fade out: halve every channel each vsync, then black, then idle. */
++		/*
++		 * elish: one black fill, then idle until on again. The old six-step
++		 * fade rewrote the whole panel per step while it scanned out, which
++		 * showed as six top-to-bottom wipes. 64-bit stores make the fill
++		 * short (rows are 6400 bytes, 8-byte aligned).
++		 */
+ 		uint32_t step = fb->fFadeStep;
+-		if (step <= 6) {
+-			fb->fFadeStep = step + 1;
++		if (step == 0) {
++			fb->fFadeStep = 1;
+ 		}
+ 		IOLockUnlock(fb->fLock);
+-		if (step <= 6) {
++		if (step == 0) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+-				for (uint32_t x = 0; x < fb->fWidth; x++) {
+-					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
++				uintptr_t line = fb->fPixels + (uint64_t)y * fb->fRowBytes;
++				uint32_t bytes = fb->fWidth * 4;
++				uint32_t i = 0;
++				for (; i + 8 <= bytes && ((line + i) & 7) == 0; i += 8) {
++					*(volatile uint64_t *)(line + i) = 0;
++				}
++				for (; i < bytes; i += 4) {
++					*(volatile uint32_t *)(line + i) = 0;
+ 				}
+ 			}
+ 		}
