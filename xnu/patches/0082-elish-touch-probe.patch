@@ -1,0 +1,91 @@
+diff --git a/bsd/dev/sweet_pstore.c b/bsd/dev/sweet_pstore.c
+--- a/bsd/dev/sweet_pstore.c
++++ b/bsd/dev/sweet_pstore.c
+@@ -230,6 +230,79 @@
+ 	}
+ }
+ 
++/*
++ * elish touch bring-up, step 2: READ-ONLY probe of the Novatek NT36523 path
++ * (QUPv3 wrapper 0 SE4 at 0x990000 = DT spi@990000, TLMM gpio33/gpio39).
++ * Nothing is written. GCC and TLMM are always readable; the SE and wrapper
++ * registers are read only when GCC says their AHB and core clocks are on,
++ * because an unclocked access can hang the bus. Boot-arg elishtouchprobe=0
++ * skips it. Offsets: gcc-kona.c, pinctrl-kona.c, qcom-geni-se.h (LineageOS).
++ */
++#define ELISH_GCC_PA            0x00100000ULL
++#define ELISH_TLMM_SOUTH_PA     0x0f500000ULL
++#define ELISH_SE4_PA            0x00990000ULL
++#define ELISH_QUP0_PA           0x009c0000ULL
++#define ELISH_CBCR_OFF          (1u << 31)
++
++static uint32_t
++elish_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static void
++elish_touch_probe(void)
++{
++	uint32_t on = 1;
++	PE_parse_boot_argn("elishtouchprobe", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	vm_offset_t g17 = ml_io_map((vm_offset_t)(ELISH_GCC_PA + 0x17000), 0x1000);
++	vm_offset_t g23 = ml_io_map((vm_offset_t)(ELISH_GCC_PA + 0x23000), 0x1000);
++	vm_offset_t g52 = ml_io_map((vm_offset_t)(ELISH_GCC_PA + 0x52000), 0x1000);
++	vm_offset_t tlmm33 = ml_io_map((vm_offset_t)(ELISH_TLMM_SOUTH_PA + 33 * 0x1000), 0x1000);
++	vm_offset_t tlmm39 = ml_io_map((vm_offset_t)(ELISH_TLMM_SOUTH_PA + 39 * 0x1000), 0x1000);
++	if (!g17 || !g23 || !g52 || !tlmm33 || !tlmm39) {
++		printf("ELISH TOUCH: probe map failed\n");
++		return;
++	}
++	uint32_t vote = elish_rd(g52, 0x008);
++	uint32_t m_ahb = elish_rd(g17, 0x004), s_ahb = elish_rd(g17, 0x008);
++	uint32_t core = elish_rd(g23, 0x000), core2x = elish_rd(g23, 0x008);
++	uint32_t s4 = elish_rd(g17, 0x4cc);
++	printf("ELISH TOUCH: GCC vote 0x52008=%08x (m_ahb b6 %u s_ahb b7 %u core b8 %u core2x b9 %u s4 b14 %u)\n",
++	    vote, (vote >> 6) & 1, (vote >> 7) & 1, (vote >> 8) & 1, (vote >> 9) & 1, (vote >> 14) & 1);
++	printf("ELISH TOUCH: CBCR m_ahb %08x s_ahb %08x core %08x core2x %08x s4 %08x (bit31 = off)\n",
++	    m_ahb, s_ahb, core, core2x, s4);
++	printf("ELISH TOUCH: S4 RCG cmd %08x cfg %08x m %08x n %08x d %08x\n",
++	    elish_rd(g17, 0x4d0), elish_rd(g17, 0x4d4), elish_rd(g17, 0x4d8),
++	    elish_rd(g17, 0x4dc), elish_rd(g17, 0x4e0));
++	printf("ELISH TOUCH: gpio33 cfg %08x io %08x | gpio39 cfg %08x io %08x intr %08x/%08x\n",
++	    elish_rd(tlmm33, 0x0), elish_rd(tlmm33, 0x4), elish_rd(tlmm39, 0x0), elish_rd(tlmm39, 0x4),
++	    elish_rd(tlmm39, 0x8), elish_rd(tlmm39, 0xc));
++
++	bool clocked = !(m_ahb & ELISH_CBCR_OFF) && !(s_ahb & ELISH_CBCR_OFF) && !(core & ELISH_CBCR_OFF);
++	if (!clocked) {
++		printf("ELISH TOUCH: QUP0 AHB/core clocks off: SE4 registers not read\n");
++		return;
++	}
++	vm_offset_t se = ml_io_map((vm_offset_t)ELISH_SE4_PA, 0x4000);
++	vm_offset_t qup = ml_io_map((vm_offset_t)ELISH_QUP0_PA, 0x2000);
++	if (!se || !qup) {
++		printf("ELISH TOUCH: SE map failed\n");
++		return;
++	}
++	uint32_t fw = elish_rd(se, 0x068);
++	printf("ELISH TOUCH: QUP0 hw ver %08x | SE4 fw_rev %08x (protocol %u: 1 SPI 2 UART 3 I2C) status %08x\n",
++	    elish_rd(qup, 0x004), fw, (fw >> 8) & 0xff, elish_rd(se, 0x040));
++	printf("ELISH TOUCH: SE4 force_def %08x out_ctrl %08x cgc %08x m_clk %08x clk_sel %08x dma_mode %08x\n",
++	    elish_rd(se, 0x020), elish_rd(se, 0x024), elish_rd(se, 0x028), elish_rd(se, 0x048),
++	    elish_rd(se, 0x07c), elish_rd(se, 0x258));
++	printf("ELISH TOUCH: SE4 m_irq %08x hw_param0 %08x hw_param1 %08x\n",
++	    elish_rd(se, 0x610), elish_rd(se, 0xe24), elish_rd(se, 0xe28));
++}
++
+ /* From SweetPlatformExpert::start (threads and IOKit are up). */
+ void sweet_watch_start(void);
+ 
+@@ -237,6 +310,7 @@
+ sweet_watch_start(void)
+ {
+ 	thread_t thread;
++	elish_touch_probe();
+ 	if (kernel_thread_start(sweet_watch_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
