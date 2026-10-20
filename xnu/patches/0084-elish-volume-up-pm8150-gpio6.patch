@@ -1,0 +1,19 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -152,7 +152,14 @@
+ 		return;
+ 	}
+ 	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
++	/*
++	 * Volume-up GPIO peripheral (PPID). sweet: PM6150L SID 4 GPIO2 (0x4c1).
++	 * elish (DTB gpio_keys/vol_up): PM8150 SID 0 GPIO6 at 0xc500 -> 0x0c5,
++	 * active low with pull-up like sweet's. Boot-arg sweetvolup overrides.
++	 */
++	uint32_t volup_ppid = 0x0c5;
++	(void)PE_parse_boot_argn("sweetvolup", &volup_ppid, sizeof(volup_ppid));
++	keys_gpio_apid = keys_find_apid((uint16_t)volup_ppid, count);
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
