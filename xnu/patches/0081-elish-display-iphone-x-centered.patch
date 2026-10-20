@@ -1,0 +1,37 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -75,8 +75,9 @@
+  * screens (UIKit: "No status bar visual provider for screen", the red
+  * rdar://45025538 bar for 360x800 points). The display is therefore
+  * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+- * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+- * Boot-arg sweetfb_native=1 presents the real panel size instead.
++ * centered 1080x2400 part of it is shown on the 1080x2400 panel. A larger
++ * panel (elish, 1600x2560) shows the whole 1125x2436 display centered, with
++ * black borders. Boot-arg sweetfb_native=1 presents the real panel size instead.
+  */
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
+@@ -170,7 +171,7 @@
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
++	if (!native) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+@@ -322,6 +323,12 @@
+ 			 * writes the read-only-late cons_ops_index and panics. */
+ 			sweet_console_muted = 1;
+ 		}
++		/* Panel larger than the presented display: clear the borders once. */
++		if (fOffX < 0 || fOffY < 0) {
++			for (uint32_t y = 0; y < fHeight; y++) {
++				memset((void *)(fPixels + (uint64_t)y * fRowBytes), 0, (size_t)fWidth * 4);
++			}
++		}
+ 	}
+ 
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
