@@ -1,0 +1,267 @@
+diff --git a/bsd/dev/sweet_pstore.c b/bsd/dev/sweet_pstore.c
+--- a/bsd/dev/sweet_pstore.c
++++ b/bsd/dev/sweet_pstore.c
+@@ -961,19 +961,31 @@
+ 
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ 
+-/* Returns -1 for a frame to skip, else a bitmask of fingers down. */
++#define NVT_BAD_CSUM    (-1)    /* checksum mismatch */
++#define NVT_BAD_ESD     (-2)    /* 77 x6: firmware recovery handshake */
++#define NVT_BAD_WDT     (-3)    /* FD/FE x6: firmware watchdog reset (nvt_wdt_fw_recovery) */
++
++/* Returns NVT_BAD_* for a frame to skip, else a bitmask of fingers down. */
+ static int
+ nvt_decode(const uint8_t *d, uint32_t xf, int *hx, int *hy)
+ {
++	unsigned wdt = 0, esd = 0;
++	for (unsigned i = 0; i < 6; i++) {
++		wdt += d[i] == 0xfd || d[i] == 0xfe;
++		esd += d[i] == 0x77;
++	}
++	if (wdt == 6) {
++		return NVT_BAD_WDT;
++	}
++	if (esd == 6) {
++		return NVT_BAD_ESD;
++	}
+ 	uint8_t sum = 0;
+ 	for (unsigned i = 0; i < 64; i++) {
+ 		sum += d[i];
+ 	}
+ 	if ((uint8_t)(~sum + 1u) != d[64]) {
+-		return -1;
+-	}
+-	if (d[0] == 0x77 && d[1] == 0x77 && d[2] == 0x77 && d[3] == 0x77 && d[4] == 0x77 && d[5] == 0x77) {
+-		return -1;
++		return NVT_BAD_CSUM;
+ 	}
+ 	int mask = 0;
+ 	for (unsigned i = 0; i < NVT_FINGERS; i++) {
+@@ -1004,10 +1016,30 @@
+ 	return mask;
+ }
+ 
++/* Hex dump of one 65-byte report, 4 lines of 17/16 bytes. */
++static void
++nvt_dump(const char *why, unsigned n, const uint8_t *d)
++{
++	uint8_t sum = 0;
++	for (unsigned i = 0; i < 64; i++) {
++		sum += d[i];
++	}
++	printf("ELISH TOUCH: 5 %s #%u csum want %02x got %02x\n", why, n, (uint8_t)(~sum + 1u), d[64]);
++	for (unsigned off = 0; off < NVT_POINT_LEN; off += 17) {
++		char line[17 * 3 + 1];
++		unsigned len = NVT_POINT_LEN - off < 17 ? NVT_POINT_LEN - off : 17;
++		for (unsigned j = 0; j < len; j++) {
++			(void)snprintf(line + j * 3u, 4, "%02x ", d[off + j]);
++		}
++		line[len * 3u] = 0;
++		printf("ELISH TOUCH: 5   %02u: %s\n", off, line);
++	}
++}
++
+ static void
+-nvt_touch_loop(vm_offset_t s39)
++nvt_touch_loop(vm_offset_t s39, const uint8_t *fw, unsigned fwsize)
+ {
+-	unsigned irq_low = 0;
++	unsigned irq_low = 0, n_csum = 0, n_esd = 0, n_wdt = 0, wdt_run = 0, reloads = 0, dumped = 0, good_dumped = 0;
+ 	uint32_t xf = 0, poll = 8;
+ 	PE_parse_boot_argn("elishtouchxf", &xf, sizeof(xf));
+ 	PE_parse_boot_argn("elishtouchpoll", &poll, sizeof(poll));
+@@ -1033,8 +1065,32 @@
+ 			(void)nvt_set_page(NVT_EVENT_BUF);
+ 		} else if (mask < 0) {
+ 			bad++;
++			n_csum += mask == NVT_BAD_CSUM;
++			n_esd += mask == NVT_BAD_ESD;
++			n_wdt += mask == NVT_BAD_WDT;
++			/* First 6 bad reports, then one in 2000 (~16 s at 8 ms). */
++			if (dumped < 6 || (bad % 2000u) == 0) {
++				dumped++;
++				nvt_dump(mask == NVT_BAD_WDT ? "bad wdt" : mask == NVT_BAD_ESD ? "bad esd" : "bad csum", bad, d);
++			}
++			/* nvt_wdt_fw_recovery(): more than 10 FD/FE reports in a row -> reload firmware. */
++			wdt_run = mask == NVT_BAD_WDT ? wdt_run + 1 : 0;
++			if (wdt_run > 10 && reloads < 5 && fw) {
++				wdt_run = 0;
++				reloads++;
++				printf("ELISH TOUCH: 5 firmware watchdog pattern; reload %u\n", reloads);
++				if (nvt_download(fw, fwsize) == 0) {
++					nvt_fw_info();
++				}
++				(void)nvt_set_page(NVT_EVENT_BUF);
++			}
+ 		} else {
+ 			frames++;
++			wdt_run = 0;
++			if (good_dumped < 3 && mask) {
++				good_dumped++;
++				nvt_dump("good", frames, d);
++			}
+ 			for (unsigned i = 0; i < NVT_FINGERS; i++) {
+ 				int bit = 1 << i;
+ 				if (mask & bit) {
+@@ -1055,8 +1111,8 @@
+ 		}
+ 		irq_low += !(elish_rd(s39, 4) & 1u);
+ 		if (++ticks % (30000u / poll) == 0) {
+-			printf("ELISH TOUCH: 5 alive polls %u frames %u bad %u errors %u down %x irq-low %u\n",
+-			    ticks, frames, bad, errors, (unsigned)down, irq_low);
++			printf("ELISH TOUCH: 5 alive polls %u frames %u bad %u (csum %u esd %u wdt %u) reloads %u errors %u down %x irq-low %u\n",
++			    ticks, frames, bad, n_csum, n_esd, n_wdt, reloads, errors, (unsigned)down, irq_low);
+ 		}
+ 		espi_sleep(poll);
+ 	}
+@@ -1186,7 +1242,7 @@
+ 			printf("ELISH TOUCH: 4 firmware download OK\n");
+ 			nvt_fw_info();
+ 			if (touch >= 4) {
+-				nvt_touch_loop(s39);
++				nvt_touch_loop(s39, (const uint8_t *)fw, fwsize);
+ 			}
+ 		} else {
+ 			printf("ELISH TOUCH: 4 firmware download FAILED\n");
+@@ -1198,6 +1254,132 @@
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * Backlight (boot-arg elishbl, default 2047 = full; > 2047 leaves ABL's
++ * level). The KTZ8866 at 0x11 on i2c@a8c000 (QUP wrapper 1 SE3) sets the
++ * LCD backlight; ABL leaves it at 0x3f1, Linux raises it to 0x709 at boot.
++ * Brightness is 11 bits: register 0x04 bits 2:0, register 0x05 bits 10:3.
++ * No clocks of that serial engine are touched: its pins (SDA gpio60, SCL
++ * gpio61, SOUTH TLMM) are borrowed as open-drain GPIOs, the latch held low
++ * and OE toggled (OE off = released, the board pull-ups lift the line),
++ * then put back exactly as they were. Only those two registers are written.
++ */
++#define BL_PIN_SDA      60u
++#define BL_PIN_SCL      61u
++#define BL_ADDR         0x11u
++
++static vm_offset_t bl_tlmm;
++static uint32_t bl_cfg[2];
++
++static void
++bl_line(unsigned line, int high)
++{
++	elish_wr(bl_tlmm, line * 0x1000u, bl_cfg[line] | (high ? 0 : 0x200u));
++	delay(5);
++}
++
++static int
++bl_get(unsigned line)
++{
++	return (int)(elish_rd(bl_tlmm, line * 0x1000u + 4u) & 1u);
++}
++
++/* SCL high, honouring clock stretching for up to ~1 ms. */
++static bool
++bl_scl_high(void)
++{
++	bl_line(1, 1);
++	for (unsigned i = 0; i < 200; i++) {
++		if (bl_get(1)) {
++			return true;
++		}
++		delay(5);
++	}
++	return false;
++}
++
++/* Clock out one byte MSB first; returns true on ACK. */
++static bool
++bl_byte(uint8_t v)
++{
++	for (int b = 7; b >= 0; b--) {
++		bl_line(0, (v >> b) & 1);
++		if (!bl_scl_high()) {
++			return false;
++		}
++		bl_line(1, 0);
++	}
++	bl_line(0, 1);
++	if (!bl_scl_high()) {
++		return false;
++	}
++	bool ack = !bl_get(0);
++	bl_line(1, 0);
++	return ack;
++}
++
++static void
++bl_stop(void)
++{
++	bl_line(0, 0);
++	(void)bl_scl_high();
++	bl_line(0, 1);
++}
++
++/* One register write: START, addr+W, reg, value, STOP. */
++static bool
++bl_write(uint8_t reg, uint8_t val)
++{
++	if (!bl_get(0) || !bl_get(1)) {
++		return false;   /* bus not idle */
++	}
++	bl_line(0, 0);          /* START: SDA falls while SCL is high */
++	bl_line(1, 0);
++	bool ok = bl_byte((uint8_t)(BL_ADDR << 1)) && bl_byte(reg) && bl_byte(val);
++	bl_stop();
++	return ok;
++}
++
++static void
++elish_backlight(void)
++{
++	uint32_t level = 2047;
++	PE_parse_boot_argn("elishbl", &level, sizeof(level));
++	if (level > 2047) {
++		printf("ELISH BL: left at the bootloader's level\n");
++		return;
++	}
++	bl_tlmm = ml_io_map((vm_offset_t)(ELISH_TLMM_SOUTH_PA + BL_PIN_SDA * 0x1000), 0x2000);
++	if (!bl_tlmm) {
++		printf("ELISH BL: map failed\n");
++		return;
++	}
++	uint32_t saved_cfg[2], saved_io[2];
++	for (unsigned i = 0; i < 2; i++) {
++		saved_cfg[i] = elish_rd(bl_tlmm, i * 0x1000u);
++		saved_io[i] = elish_rd(bl_tlmm, i * 0x1000u + 4u);
++		/* GPIO function, input, 2 mA, weak pull-up beside the board pull-ups */
++		bl_cfg[i] = (saved_cfg[i] & ~0x3ffu) | 3u;
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		/* Release under the current function, preload the low latch, then switch to GPIO. */
++		elish_wr(bl_tlmm, i * 0x1000u, saved_cfg[i] & ~0x200u);
++		elish_wr(bl_tlmm, i * 0x1000u + 4u, saved_io[i] & ~2u);
++		elish_wr(bl_tlmm, i * 0x1000u, bl_cfg[i]);
++	}
++	delay(20);
++	bool idle = bl_get(0) && bl_get(1);
++	bool lo = idle && bl_write(0x04, (uint8_t)(level & 7u));
++	bool hi = lo && bl_write(0x05, (uint8_t)(level >> 3));
++	for (unsigned i = 0; i < 2; i++) {
++		elish_wr(bl_tlmm, i * 0x1000u, bl_cfg[i]);              /* released */
++		elish_wr(bl_tlmm, i * 0x1000u + 4u, saved_io[i] & 2u);  /* latch as before */
++		elish_wr(bl_tlmm, i * 0x1000u, saved_cfg[i]);
++	}
++	printf("ELISH BL: KTZ8866 brightness %u/2047 %s (bus idle %d, pins %08x %08x)\n", level,
++	    hi ? "set" : "NOT set", idle, saved_cfg[0], saved_cfg[1]);
++}
++
+ /* From SweetPlatformExpert::start (threads and IOKit are up). */
+ void sweet_watch_start(void);
+ 
+@@ -1205,6 +1387,7 @@
+ sweet_watch_start(void)
+ {
+ 	thread_t thread;
++	elish_backlight();
+ 	elish_touch_probe();
+ 	uint32_t touch = 0;
+ 	PE_parse_boot_argn("elishtouch", &touch, sizeof(touch));
