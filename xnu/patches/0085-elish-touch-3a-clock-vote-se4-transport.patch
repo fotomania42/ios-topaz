@@ -1,0 +1,103 @@
+diff --git a/bsd/dev/sweet_pstore.c b/bsd/dev/sweet_pstore.c
+--- a/bsd/dev/sweet_pstore.c
++++ b/bsd/dev/sweet_pstore.c
+@@ -237,12 +237,21 @@
+  * registers are read only when GCC says their AHB and core clocks are on,
+  * because an unclocked access can hang the bus. Boot-arg elishtouchprobe=0
+  * skips it. Offsets: gcc-kona.c, pinctrl-kona.c, qcom-geni-se.h (LineageOS).
++ *
++ * Step 3a (boot-arg elishtouch=1, default 0): the single write is an OR of
++ * the QUP0 m_ahb/s_ahb/core/core2x/S4 bits into the apps GCC vote register,
++ * as the Linux clk driver does. The S4 RCG is left alone: firmware leaves it
++ * on XO with no divider (cfg 0x00100000), i.e. 19.2 MHz. Then the SE4
++ * transport is classified read-only: FIFO usable, or GSI-only (needs GPIO
++ * bit-bang). No SE, TLMM or touch IC register is written.
+  */
+ #define ELISH_GCC_PA            0x00100000ULL
+ #define ELISH_TLMM_SOUTH_PA     0x0f500000ULL
++#define ELISH_TLMM_NORTH_PA     0x0f900000ULL
+ #define ELISH_SE4_PA            0x00990000ULL
+ #define ELISH_QUP0_PA           0x009c0000ULL
+ #define ELISH_CBCR_OFF          (1u << 31)
++#define ELISH_QUP0_VOTES        ((1u << 6) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 14))
+ 
+ static uint32_t
+ elish_rd(vm_offset_t base, uint32_t off)
+@@ -250,6 +259,17 @@
+ 	return *(volatile uint32_t *)(base + off);
+ }
+ 
++/*
++ * gcc-kona.c: wrap_0 s_ahb (0x17008) has hwcg_bit 1. With hardware gating on,
++ * clk_branch_wait() skips HALT polling, so 0x80000002 is "on" once voted.
++ * (ios-v60 touch1 stopped on exactly this value for wrap1.)
++ */
++static bool
++elish_s_ahb_on(uint32_t s_ahb, uint32_t vote)
++{
++	return !(s_ahb & ELISH_CBCR_OFF) || ((s_ahb & 2u) && (vote & (1u << 7)));
++}
++
+ static void
+ elish_touch_probe(void)
+ {
+@@ -282,7 +302,41 @@
+ 	    elish_rd(tlmm33, 0x0), elish_rd(tlmm33, 0x4), elish_rd(tlmm39, 0x0), elish_rd(tlmm39, 0x4),
+ 	    elish_rd(tlmm39, 0x8), elish_rd(tlmm39, 0xc));
+ 
+-	bool clocked = !(m_ahb & ELISH_CBCR_OFF) && !(s_ahb & ELISH_CBCR_OFF) && !(core & ELISH_CBCR_OFF);
++	vm_offset_t north = ml_io_map((vm_offset_t)(ELISH_TLMM_NORTH_PA + 8 * 0x1000), 0x4000);
++	if (north) {
++		printf("ELISH TOUCH: SE4 pins cfg/io gpio8 %08x/%08x gpio9 %08x/%08x gpio10 %08x/%08x gpio11 %08x/%08x\n",
++		    elish_rd(north, 0x0000), elish_rd(north, 0x0004), elish_rd(north, 0x1000), elish_rd(north, 0x1004),
++		    elish_rd(north, 0x2000), elish_rd(north, 0x2004), elish_rd(north, 0x3000), elish_rd(north, 0x3004));
++	}
++
++	uint32_t touch = 0;
++	PE_parse_boot_argn("elishtouch", &touch, sizeof(touch));
++	if (touch) {
++		*(volatile uint32_t *)(g52 + 0x008) = vote | ELISH_QUP0_VOTES;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		unsigned waited = 0;
++		for (; waited < 500; waited++) {
++			vote = elish_rd(g52, 0x008);
++			m_ahb = elish_rd(g17, 0x004);
++			s_ahb = elish_rd(g17, 0x008);
++			core = elish_rd(g23, 0x000);
++			core2x = elish_rd(g23, 0x008);
++			s4 = elish_rd(g17, 0x4cc);
++			if (!(m_ahb & ELISH_CBCR_OFF) && elish_s_ahb_on(s_ahb, vote) &&
++			    !(core & ELISH_CBCR_OFF) && !(core2x & ELISH_CBCR_OFF) && !(s4 & ELISH_CBCR_OFF)) {
++				break;
++			}
++			delay(10);
++		}
++		printf("ELISH TOUCH: 3a voted %08x -> %08x after %u us: m_ahb %08x s_ahb %08x core %08x core2x %08x s4 %08x RCG cmd %08x\n",
++		    ELISH_QUP0_VOTES, vote, waited * 10, m_ahb, s_ahb, core, core2x, s4, elish_rd(g17, 0x4d0));
++		if (s4 & ELISH_CBCR_OFF) {
++			printf("ELISH TOUCH: 3a S4 clock did not start; SE4 not read\n");
++			return;
++		}
++	}
++
++	bool clocked = !(m_ahb & ELISH_CBCR_OFF) && elish_s_ahb_on(s_ahb, vote) && !(core & ELISH_CBCR_OFF);
+ 	if (!clocked) {
+ 		printf("ELISH TOUCH: QUP0 AHB/core clocks off: SE4 registers not read\n");
+ 		return;
+@@ -301,6 +355,16 @@
+ 	    elish_rd(se, 0x07c), elish_rd(se, 0x258));
+ 	printf("ELISH TOUCH: SE4 m_irq %08x hw_param0 %08x hw_param1 %08x\n",
+ 	    elish_rd(se, 0x610), elish_rd(se, 0xe24), elish_rd(se, 0xe28));
++
++	/* qcom-geni-se.h: IF_FIFO_DISABLE_RO 0x64 bit0; HW_PARAM width [29:24], depth [21:16]. */
++	uint32_t ifdis = elish_rd(se, 0x064), status = elish_rd(se, 0x040);
++	uint32_t tx = elish_rd(se, 0xe24), rx = elish_rd(se, 0xe28);
++	unsigned proto = (fw >> 8) & 0xff;
++	const char *verdict = proto != 1 ? "not SPI firmware: stop" :
++	    (ifdis & 1u) ? "GSI-only: use GPIO bit-bang SPI (gpio8-11)" :
++	    (status & 0x1001u) ? "FIFO but engine busy" : "FIFO usable: GENI SPI";
++	printf("ELISH TOUCH: SE4 transport if_fifo_disable %08x status %08x tx %u-bit x%u rx %u-bit x%u -> %s\n",
++	    ifdis, status, (tx >> 24) & 63, (tx >> 16) & 63, (rx >> 24) & 63, (rx >> 16) & 63, verdict);
+ }
+ 
+ /* From SweetPlatformExpert::start (threads and IOKit are up). */
