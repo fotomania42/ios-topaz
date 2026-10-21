@@ -1,0 +1,398 @@
+diff --git a/bsd/dev/sweet_pstore.c b/bsd/dev/sweet_pstore.c
+--- a/bsd/dev/sweet_pstore.c
++++ b/bsd/dev/sweet_pstore.c
+@@ -21,6 +21,7 @@
+ #include <kern/startup.h>
+ #include <kern/clock.h>
+ #include <kern/sched_prim.h>
++#include <kern/thread.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/libkern.h>
+@@ -28,6 +29,8 @@
+ #include <stdarg.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
+@@ -367,6 +370,365 @@
+ 	    ifdis, status, (tx >> 24) & 63, (tx >> 16) & 63, (rx >> 24) & 63, (rx >> 16) & 63, verdict);
+ }
+ 
++/*
++ * Step 3b (elishtouch=2, after the 3a clock vote): GENI SE4 FIFO SPI and the
++ * Novatek chip-ID probe, on a thread elishtouchdelay seconds (default 45)
++ * after start so the GUI is up first. SE setup follows spi-geni-qcom.c /
++ * qcom-geni-se.c (FIFO mode, mode 0, 8-bit words, CS0, no MISO sampling
++ * override); the SE IRQ line stays masked and status is polled. Pins follow
++ * the Linux pinctrl states: gpio8-11 qup4 6 mA no bias, gpio33/39 GPIO input
++ * pull-up 8 mA. The IC sequence is the Linux probe's: eng reset, bootloader
++ * reset, chip-ver-trim read (nt36xxx.c). Like Linux (NVT_TOUCH_SUPPORT_HW_RST
++ * 0) no reset GPIO is driven. No firmware is sent.
++ */
++#define ESPI_STATUS     0x040u
++#define ESPI_M_CMD      0x600u
++#define ESPI_M_CTRL     0x604u
++#define ESPI_M_IRQ      0x610u
++#define ESPI_M_IRQ_EN   0x614u
++#define ESPI_M_IRQ_CLR  0x618u
++#define ESPI_TX         0x700u
++#define ESPI_RX         0x780u
++#define ESPI_TX_STATUS  0x800u
++#define ESPI_RX_STATUS  0x804u
++#define ESPI_TX_WM      0x80cu
++#define ESPI_DONE       (1u << 0)
++#define ESPI_CANCELLED  (1u << 4)
++#define ESPI_ABORTED    (1u << 5)
++#define ESPI_RX_WM      (1u << 26)
++#define ESPI_RX_LAST    (1u << 27)
++#define ESPI_TX_WM_IRQ  (1u << 30)
++#define ESPI_ERRORS     ((7u << 1) | ESPI_CANCELLED | ESPI_ABORTED | (3u << 24) | (3u << 28))
++/* se_get_packing_config(8, 4, msb_to_lsb): wire MSB first, FIFO bytes LSB first */
++#define ESPI_PACK0      0x0007f8feu
++#define ESPI_PACK1      0x000ffefeu
++#define NVT_SWRST_N8    0x03f0feu       /* DT novatek,swrst-n8-addr */
++#define NVT_SPI_RD_FAST 0x03f310u       /* DT novatek,spi-rd-fast-addr */
++#define NVT_ENG_RST     0x7fff80u
++#define NVT_TRIM        0x03f004u
++#define NVT_TRIM_OLD    0x01f64eu
++
++static vm_offset_t espi_se;
++static bool espi_dead;
++static uint32_t espi_irq_seen;
++static int espi_chan;
++
++static uint32_t
++espi_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(espi_se + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++espi_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(espi_se + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++elish_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++espi_sleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&espi_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++espi_idle(void)
++{
++	for (unsigned i = 0; i < 5000; i++) {
++		if (!(espi_rd(ESPI_STATUS) & 1u)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* Only for a command this driver started: cancel, then abort (Linux timeout path). */
++static void
++espi_stop(void)
++{
++	static const uint32_t ctrl[2] = {1u << 2, 1u << 1};
++	static const uint32_t ack[2] = {ESPI_CANCELLED, ESPI_ABORTED};
++	for (unsigned k = 0; k < 2; k++) {
++		espi_wr(ESPI_M_CTRL, ctrl[k]);
++		for (unsigned i = 0; i < 5000; i++) {
++			if (espi_rd(ESPI_M_IRQ) & ack[k]) {
++				break;
++			}
++			delay(1);
++		}
++		if (espi_idle()) {
++			break;
++		}
++	}
++	for (unsigned i = 0; i < 32 && (espi_rd(ESPI_RX_STATUS) & 0x1ffffffu); i++) {
++		(void)espi_rd(ESPI_RX);
++	}
++	espi_wr(ESPI_TX_WM, 0);
++	espi_wr(ESPI_M_IRQ_CLR, 0xffffffffu);
++	if (!espi_idle() || (espi_rd(ESPI_TX_STATUS) & 0xfffffffu)) {
++		espi_dead = true;
++		printf("ELISH TOUCH: 3b SE4 stuck after cancel/abort status %08x tx %08x; stopping\n",
++		    espi_rd(ESPI_STATUS), espi_rd(ESPI_TX_STATUS));
++	}
++}
++
++/* One CS-framed transfer of n <= 64 bytes: TX only, or full duplex when rx. */
++static int
++espi_xfer(const uint8_t *tx, uint8_t *rx, unsigned n)
++{
++	if (espi_dead || n == 0 || n > 64) {
++		return -1;
++	}
++	if (!espi_idle()) {
++		espi_dead = true;
++		return -2;
++	}
++	espi_irq_seen = 0;
++	espi_wr(ESPI_M_IRQ_CLR, 0xffffffffu);
++	espi_wr(0x25c, espi_rd(0x25c) & ~1u);   /* SPI_TRANS_CFG: no CS toggle */
++	espi_wr(0x26c, n);                      /* SPI_TX_TRANS_LEN (8-bit words) */
++	if (rx) {
++		espi_wr(0x270, n);              /* SPI_RX_TRANS_LEN */
++	}
++	espi_wr(ESPI_TX_WM, 1);
++	espi_wr(ESPI_M_CMD, (rx ? 3u : 1u) << 27); /* FULL_DUPLEX / TX_ONLY */
++	unsigned sent = 0, got = 0;
++	int err = -3;
++	for (unsigned i = 0; i < 20000; i++) {
++		uint32_t irq = espi_rd(ESPI_M_IRQ);
++		espi_irq_seen |= irq;
++		if (irq & ESPI_ERRORS) {
++			err = -4;
++			break;
++		}
++		if ((irq & ESPI_TX_WM_IRQ) && sent < n) {
++			while (sent < n) {
++				uint32_t word = 0;
++				for (unsigned j = 0; j < 4 && sent < n; j++) {
++					word |= (uint32_t)tx[sent++] << (8u * j);
++				}
++				espi_wr(ESPI_TX, word);
++			}
++			espi_wr(ESPI_TX_WM, 0);
++		}
++		uint32_t rs = espi_rd(ESPI_RX_STATUS);
++		unsigned wc = rs & 0x1ffffffu, last = 4;
++		if ((rs & (1u << 31)) && wc) {
++			unsigned v = (rs >> 28) & 7u;
++			last = (v && v < 4) ? v : 4;
++		}
++		if (wc > 16 || (!rx && wc)) {
++			err = -5;
++			break;
++		}
++		for (unsigned w = 0; w < wc; w++) {
++			uint32_t word = espi_rd(ESPI_RX);
++			unsigned bytes = (w + 1 == wc) ? last : 4;
++			for (unsigned j = 0; j < bytes && got < n; j++) {
++				rx[got++] = (uint8_t)(word >> (8u * j));
++			}
++		}
++		if (irq & ESPI_DONE) {
++			irq = espi_rd(ESPI_M_IRQ);
++			espi_irq_seen |= irq;
++			if (irq & ESPI_ERRORS) {
++				err = -4;
++				break;
++			}
++			if (espi_rd(ESPI_RX_STATUS) & 0x1ffffffu) {
++				continue;       /* drain the final words first */
++			}
++			espi_wr(ESPI_M_IRQ_CLR, irq);
++			if (sent == n && (!rx || got == n)) {
++				return 0;
++			}
++			err = -6;
++			break;
++		}
++		espi_wr(ESPI_M_IRQ_CLR, irq & (ESPI_RX_WM | ESPI_RX_LAST | ESPI_TX_WM_IRQ));
++		delay(1);
++	}
++	printf("ELISH TOUCH: 3b xfer err %d len %u sent %u got %u irq %08x status %08x\n",
++	    err, n, sent, got, espi_irq_seen, espi_rd(ESPI_STATUS));
++	espi_stop();
++	return err;
++}
++
++/* nt36xxx.c CTP_SPI_WRITE: bit7 of the first byte set. */
++static int
++nvt_write(const uint8_t *buf, unsigned n)
++{
++	uint8_t tx[8];
++	if (n > sizeof(tx)) {
++		return -1;
++	}
++	memcpy(tx, buf, n);
++	tx[0] |= 0x80u;
++	return espi_xfer(tx, NULL, n);
++}
++
++/* nvt_set_page + one-byte write, as nvt_write_addr(). */
++static int
++nvt_write_addr(uint32_t addr, uint8_t data)
++{
++	const uint8_t page[3] = {0xff, (uint8_t)(addr >> 15), (uint8_t)(addr >> 7)};
++	const uint8_t val[2] = {(uint8_t)(addr & 0x7fu), data};
++	int err = nvt_write(page, 3);
++	return err ? err : nvt_write(val, 2);
++}
++
++/* nvt_ts_check_chip_ver_trim(): bootloader reset, page, read 6 ID bytes. */
++static int
++nvt_read_trim(uint32_t addr, uint8_t id[6])
++{
++	const uint8_t page[3] = {0xff, (uint8_t)(addr >> 15), (uint8_t)(addr >> 7)};
++	uint8_t tx[8] = {(uint8_t)(addr & 0x7fu)}, rx[8];
++	int err = nvt_write_addr(NVT_SWRST_N8, 0x69);
++	delay(5000);                            /* tBRST2FR */
++	if (!err) {
++		err = nvt_write_addr(NVT_SPI_RD_FAST, 0x00);
++	}
++	if (!err) {
++		err = nvt_write(page, 3);
++	}
++	if (!err) {
++		memset(rx, 0xa5, sizeof(rx));
++		/* CTP_SPI_READ: addr byte, one dummy byte, then data at rbuf[2]. */
++		err = espi_xfer(tx, rx, 8);
++	}
++	if (!err) {
++		memcpy(id, rx + 2, 6);
++	}
++	return err;
++}
++
++static bool
++espi_setup(vm_offset_t north, vm_offset_t south33, vm_offset_t south39)
++{
++	uint32_t fw = espi_rd(0x068), tx = espi_rd(0xe24), rx = espi_rd(0xe28);
++	if (((fw >> 8) & 0xffu) != 1u || (espi_rd(0x064) & 1u) || (espi_rd(ESPI_STATUS) & 0x1001u) ||
++	    ((tx >> 24) & 63u) != 32u || ((rx >> 24) & 63u) != 32u ||
++	    ((tx >> 16) & 63u) < 4u || ((rx >> 16) & 63u) < 4u) {
++		printf("ELISH TOUCH: 3b SE4 not an idle FIFO SPI engine (fw %08x status %08x); stop\n",
++		    fw, espi_rd(ESPI_STATUS));
++		return false;
++	}
++	/* geni_se_init(): se_io_init, se_io_set_mode, watermarks, irq enables */
++	espi_wr(0x028, espi_rd(0x028) | 0x7fu);         /* CGC_CTRL */
++	espi_wr(0xe30, espi_rd(0xe30) | 0x0fu);         /* DMA_GENERAL_CFG clock gates on */
++	espi_wr(0x024, 0x7fu);                          /* OUTPUT_CTRL */
++	espi_wr(0x020, 1u);                             /* FORCE_DEFAULT */
++	espi_wr(0xe1c, 0);                              /* SE IRQ line masked: polled */
++	espi_wr(0x258, espi_rd(0x258) & ~1u);           /* DMA_MODE_EN off: FIFO mode */
++	espi_wr(0xe18, 0);                              /* no GSI events */
++	espi_wr(0x810, 0);                              /* RX watermark */
++	espi_wr(0x814, ((tx >> 16) & 63u) - 2u);        /* RX RFR watermark */
++	espi_wr(ESPI_M_IRQ_CLR, 0xffffffffu);
++	espi_wr(0x648, 0xffffffffu);
++	espi_wr(0xc44, 0xffffffffu);
++	espi_wr(0xd44, 0xffffffffu);
++	espi_wr(ESPI_M_IRQ_EN, ESPI_DONE | ESPI_ERRORS | ESPI_RX_WM | ESPI_RX_LAST | ESPI_TX_WM_IRQ);
++	/* setup_fifo_params(): 19.2 MHz S4 / 4 = 4.8 MHz (DT max 19.2), mode 0, CS0 */
++	espi_wr(0x07c, 0);                              /* CLK_SEL */
++	espi_wr(0x048, (4u << 4) | 1u);                 /* M_CLK_CFG div 4, enable */
++	espi_wr(0x260, ESPI_PACK0);
++	espi_wr(0x264, ESPI_PACK1);
++	espi_wr(0x284, ESPI_PACK0);
++	espi_wr(0x288, ESPI_PACK1);
++	espi_wr(0x254, 0);                              /* BYTE_GRAN = bpw >> 4 */
++	espi_wr(0x268, (espi_rd(0x268) & ~0x3ffu) | (8u - 4u)); /* WORD_LEN */
++	espi_wr(0x22c, espi_rd(0x22c) & ~3u);           /* no loopback */
++	espi_wr(0x250, 0);                              /* DEMUX_SEL CS0 */
++	espi_wr(0x224, espi_rd(0x224) & ~1u);           /* CPHA 0 */
++	espi_wr(0x230, espi_rd(0x230) & ~4u);           /* CPOL 0 */
++	espi_wr(0x24c, 0);                              /* CS active low */
++	espi_wr(0x278, 0);                              /* no CS/inter-word delays */
++	if (espi_rd(0x260) != ESPI_PACK0 || espi_rd(0x284) != ESPI_PACK0 ||
++	    (espi_rd(ESPI_TX_STATUS) & 0xfffffffu) || (espi_rd(ESPI_RX_STATUS) & 0x1ffffffu)) {
++		printf("ELISH TOUCH: 3b SE4 setup readback/FIFO not clean; stop\n");
++		return false;
++	}
++	/* TLMM cfg: pull [1:0], function [5:2], drive [8:6] (mA/2 - 1), OE [9] */
++	for (unsigned p = 0; p < 4; p++) {
++		uint32_t cfg = elish_rd(north, p * 0x1000u);
++		elish_wr(north, p * 0x1000u, (cfg & ~0x3ffu) | (1u << 2) | (2u << 6));
++	}
++	elish_wr(south33, 0, (elish_rd(south33, 0) & ~0x3ffu) | 3u | (3u << 6));
++	elish_wr(south39, 0, (elish_rd(south39, 0) & ~0x3ffu) | 3u | (3u << 6));
++	printf("ELISH TOUCH: 3b SE4 FIFO SPI 4.8 MHz mode 0 ready; pins gpio8-11 %08x %08x %08x %08x gpio33 %08x/%08x gpio39 %08x/%08x\n",
++	    elish_rd(north, 0), elish_rd(north, 0x1000), elish_rd(north, 0x2000), elish_rd(north, 0x3000),
++	    elish_rd(south33, 0), elish_rd(south33, 4), elish_rd(south39, 0), elish_rd(south39, 4));
++	return true;
++}
++
++static void
++elish_touch_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	uint32_t delay_s = 45;
++	PE_parse_boot_argn("elishtouchdelay", &delay_s, sizeof(delay_s));
++	if (delay_s > 600) {
++		delay_s = 600;
++	}
++	printf("ELISH TOUCH: 3b starting in %u s\n", delay_s);
++	espi_sleep(delay_s * 1000u);
++	espi_se = ml_io_map((vm_offset_t)ELISH_SE4_PA, 0x4000);
++	vm_offset_t north = ml_io_map((vm_offset_t)(ELISH_TLMM_NORTH_PA + 8 * 0x1000), 0x4000);
++	vm_offset_t s33 = ml_io_map((vm_offset_t)(ELISH_TLMM_SOUTH_PA + 33 * 0x1000), 0x1000);
++	vm_offset_t s39 = ml_io_map((vm_offset_t)(ELISH_TLMM_SOUTH_PA + 39 * 0x1000), 0x1000);
++	if (!espi_se || !north || !s33 || !s39) {
++		printf("ELISH TOUCH: 3b map failed\n");
++		goto out;
++	}
++	if (!espi_setup(north, s33, s39)) {
++		goto out;
++	}
++	/* nvt_ts_probe: eng reset, 10 ms after POR, then up to 5 trim reads per address */
++	int err = nvt_write_addr(NVT_ENG_RST, 0x5a);
++	delay(1000);
++	espi_sleep(10);
++	printf("ELISH TOUCH: 3b eng reset err %d irq %08x\n", err, espi_irq_seen);
++	static const uint32_t trims[2] = {NVT_TRIM, NVT_TRIM_OLD};
++	bool found = false;
++	for (unsigned a = 0; a < 2 && !found && !espi_dead; a++) {
++		for (unsigned t = 0; t < 5 && !found && !espi_dead; t++) {
++			uint8_t id[6] = {0};
++			err = nvt_read_trim(trims[a], id);
++			/* trim_id_table, NT36523 rows: id[3..5] = 23 65 03 */
++			found = !err && id[3] == 0x23 && id[4] == 0x65 && id[5] == 0x03;
++			printf("ELISH TOUCH: 3b trim %06x try %u err %d id %02x %02x %02x %02x %02x %02x irq %08x%s\n",
++			    trims[a], t, err, id[0], id[1], id[2], id[3], id[4], id[5], espi_irq_seen,
++			    found ? " -> NT36523" : "");
++			if (!found) {
++				espi_sleep(10);
++			}
++		}
++	}
++	printf("ELISH TOUCH: 3b result: %s\n", found ? "NT36523 identified over GENI SPI" :
++	    espi_dead ? "SE4 stopped" : "chip not identified");
++out:
++	printf("ELISH TOUCH: 3b done\n");
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ /* From SweetPlatformExpert::start (threads and IOKit are up). */
+ void sweet_watch_start(void);
+ 
+@@ -375,6 +737,11 @@
+ {
+ 	thread_t thread;
+ 	elish_touch_probe();
++	uint32_t touch = 0;
++	PE_parse_boot_argn("elishtouch", &touch, sizeof(touch));
++	if (touch >= 2 && kernel_thread_start(elish_touch_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ 	if (kernel_thread_start(sweet_watch_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
