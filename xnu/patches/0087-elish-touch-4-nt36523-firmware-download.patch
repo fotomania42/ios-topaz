@@ -1,0 +1,417 @@
+diff --git a/bsd/dev/sweet_pstore.c b/bsd/dev/sweet_pstore.c
+--- a/bsd/dev/sweet_pstore.c
++++ b/bsd/dev/sweet_pstore.c
+@@ -24,6 +24,7 @@
+ #include <kern/thread.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+ #include <machine/atomic.h>
+ #include <stdarg.h>
+@@ -488,11 +489,16 @@
+ 	}
+ }
+ 
+-/* One CS-framed transfer of n <= 64 bytes: TX only, or full duplex when rx. */
++/*
++ * One CS-framed transfer of hdr[nh] then data[nd]: TX only (up to 64 KiB,
++ * the FIFO refilled on each TX watermark like geni_spi_handle_tx), or full
++ * duplex into rx when rx != NULL (n <= 64, one FIFO's worth).
++ */
+ static int
+-espi_xfer(const uint8_t *tx, uint8_t *rx, unsigned n)
++espi_xfer_long(const uint8_t *hdr, unsigned nh, const uint8_t *data, unsigned nd, uint8_t *rx)
+ {
+-	if (espi_dead || n == 0 || n > 64) {
++	unsigned n = nh + nd;
++	if (espi_dead || n == 0 || n > 0x10000u || (rx && n > 64)) {
+ 		return -1;
+ 	}
+ 	if (!espi_idle()) {
+@@ -510,7 +516,7 @@
+ 	espi_wr(ESPI_M_CMD, (rx ? 3u : 1u) << 27); /* FULL_DUPLEX / TX_ONLY */
+ 	unsigned sent = 0, got = 0;
+ 	int err = -3;
+-	for (unsigned i = 0; i < 20000; i++) {
++	for (unsigned i = 0; i < 20000u + 4u * n; i++) {
+ 		uint32_t irq = espi_rd(ESPI_M_IRQ);
+ 		espi_irq_seen |= irq;
+ 		if (irq & ESPI_ERRORS) {
+@@ -518,14 +524,18 @@
+ 			break;
+ 		}
+ 		if ((irq & ESPI_TX_WM_IRQ) && sent < n) {
+-			while (sent < n) {
++			/* Room for depth - watermark words (16 - 1). */
++			for (unsigned w = 0; w < 15 && sent < n; w++) {
+ 				uint32_t word = 0;
+-				for (unsigned j = 0; j < 4 && sent < n; j++) {
+-					word |= (uint32_t)tx[sent++] << (8u * j);
++				for (unsigned j = 0; j < 4 && sent < n; j++, sent++) {
++					uint8_t b = sent < nh ? hdr[sent] : data[sent - nh];
++					word |= (uint32_t)b << (8u * j);
+ 				}
+ 				espi_wr(ESPI_TX, word);
+ 			}
+-			espi_wr(ESPI_TX_WM, 0);
++			if (sent == n) {
++				espi_wr(ESPI_TX_WM, 0);
++			}
+ 		}
+ 		uint32_t rs = espi_rd(ESPI_RX_STATUS);
+ 		unsigned wc = rs & 0x1ffffffu, last = 4;
+@@ -570,6 +580,12 @@
+ 	return err;
+ }
+ 
++static int
++espi_xfer(const uint8_t *tx, uint8_t *rx, unsigned n)
++{
++	return espi_xfer_long(tx, n, NULL, 0, rx);
++}
++
+ /* nt36xxx.c CTP_SPI_WRITE: bit7 of the first byte set. */
+ static int
+ nvt_write(const uint8_t *buf, unsigned n)
+@@ -583,6 +599,29 @@
+ 	return espi_xfer(tx, NULL, n);
+ }
+ 
++/* nvt_set_page(): 0xFF, addr[22:15], addr[14:7]. */
++static int
++nvt_set_page(uint32_t addr)
++{
++	const uint8_t page[3] = {0xff, (uint8_t)(addr >> 15), (uint8_t)(addr >> 7)};
++	return nvt_write(page, 3);
++}
++
++/* CTP_SPI_READ of n data bytes at the current page offset off: rx[2..] = data. */
++static int
++nvt_read(uint8_t off, uint8_t *out, unsigned n)
++{
++	uint8_t tx[64] = {(uint8_t)(off & 0x7fu)}, rx[64];
++	if (n + 2 > sizeof(rx)) {
++		return -1;
++	}
++	int err = espi_xfer(tx, rx, n + 2);
++	if (!err) {
++		memcpy(out, rx + 2, n);
++	}
++	return err;
++}
++
+ /* nvt_set_page + one-byte write, as nvt_write_addr(). */
+ static int
+ nvt_write_addr(uint32_t addr, uint8_t data)
+@@ -618,6 +657,287 @@
+ 	return err;
+ }
+ 
++/*
++ * Step 4 (elishtouch=3): nvt_download_firmware_hw_crc() for NT36523
++ * (hw_crc 2, cascade header) from nt36xxx_fw_update.c, into the IC's RAM
++ * only (host-download part, nothing persistent). The firmware comes from
++ * the ADT node /elish-touch (mkboot_elish.py --touch-fw); it is never part
++ * of the kernel source. Addresses: NT36523_memory_map in nt36xxx_mem_map.h.
++ */
++#define NVT_EVENT_BUF       0x2fe00u
++#define NVT_BOOT_RDY        0x3f10du
++#define NVT_TX_AUTO_COPY    0x3f7e8u
++#define NVT_SPI_DMA_TX      0x3f7f1u
++#define NVT_ILM_LENGTH      0x3f118u
++#define NVT_DLM_LENGTH      0x3f130u
++#define NVT_ILM_DES         0x3f128u
++#define NVT_DLM_DES         0x3f12cu
++#define NVT_G_ILM_CSUM      0x3f100u
++#define NVT_G_DLM_CSUM      0x3f104u
++#define NVT_R_ILM_CSUM      0x3f120u
++#define NVT_R_DLM_CSUM      0x3f124u
++#define NVT_BLD_ILM_DLM_CRC 0x3f133u
++#define NVT_BLD_CRC_EN      0x3f30eu
++#define NVT_XFER_MAX        (63u * 1024u)       /* NVT_TRANSFER_LEN */
++#define NVT_MAX_PARTS       32u
++
++struct nvt_part {
++	uint32_t sram, size, bin, crc;
++};
++
++static uint32_t
++nvt_le32(const uint8_t *p)
++{
++	return p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++/* update_firmware_request() checks + nvt_bin_header_parser() (hw_crc != 0). */
++static int
++nvt_fw_parse(const uint8_t *fw, unsigned fwsize, struct nvt_part *p, unsigned *count, unsigned *cascade)
++{
++	unsigned need = 0;
++	for (unsigned i = fwsize / 4096u; i > 0 && !need; i--) {
++		const uint8_t *f = fw + i * 4096u - 3u;
++		if ((f[0] == 'N' && f[1] == 'V' && f[2] == 'T') || (f[0] == 'M' && f[1] == 'O' && f[2] == 'D')) {
++			need = i * 4096u;
++		}
++	}
++	if (!need || ((fw[need - 4096u] + fw[need - 4096u + 1u]) & 0xffu) != 0xffu) {
++		return -10;     /* no end flag, or FW_VER + FW_VER_BAR != 0xFF */
++	}
++	uint32_t end = nvt_le32(fw);
++	if (end < 0x30u || end > fwsize || fwsize < 0x30u) {
++		return -11;
++	}
++	*cascade = (fw[0x20] & 2u) >> 1;
++	unsigned info = 0, ovly = (fw[0x28] & 0x10u) ? (fw[0x28] & 0x0fu) : 0;
++	for (uint32_t pos = 0x30; pos < (*cascade ? end / 2u : end); pos += 0x10u) {
++		info++;
++	}
++	if (*cascade) {
++		info++;
++	}
++	*count = 2u + ovly + info;
++	if (*count > NVT_MAX_PARTS) {
++		return -12;
++	}
++	uint32_t pos = 0;
++	bool header = false;
++	for (unsigned n = 0; n < *count; n++) {
++		if (n < 2) {
++			p[n].bin = nvt_le32(fw + n * 12u);
++			p[n].sram = nvt_le32(fw + 4u + n * 12u);
++			p[n].size = nvt_le32(fw + 8u + n * 12u);
++			p[n].crc = nvt_le32(fw + 0x18u + n * 4u);
++			continue;
++		}
++		if (n < 2u + info) {
++			if (!header) {
++				pos = 0x30u + 0x10u * (n - 2u);
++			} else if (*cascade) {
++				pos = end - 0x10u;
++			}
++		} else {
++			pos = p[1].bin + 0x10u * (n - 2u - info);
++		}
++		if (pos + 16u > fwsize) {
++			return -13;
++		}
++		p[n].sram = nvt_le32(fw + pos);
++		p[n].size = nvt_le32(fw + pos + 4u);
++		p[n].bin = nvt_le32(fw + pos + 8u);
++		p[n].crc = nvt_le32(fw + pos + 12u);
++		if (n < 2u + info && p[n].bin < end && p[n].size) {
++			header = true;
++		}
++	}
++	for (unsigned n = 0; n < *count; n++) {
++		/* nvt_write_firmware() sends size + 1 bytes of every non-empty part. */
++		if (p[n].size && ((uint64_t)p[n].bin + p[n].size + 1u > fwsize || p[n].size >= 0x1000000u)) {
++			return -14;
++		}
++	}
++	return 0;
++}
++
++/* nvt_write_sram(): NVT_TRANSFER_LEN bursts, each set_page + [offset | 0x80, data]. */
++static int
++nvt_write_sram(const uint8_t *fw, uint32_t sram, uint32_t size, uint32_t bin)
++{
++	while (size) {
++		uint32_t len = size < NVT_XFER_MAX ? size : NVT_XFER_MAX;
++		uint8_t off = (uint8_t)((sram & 0x7fu) | 0x80u);
++		int err = nvt_set_page(sram);
++		if (!err) {
++			err = espi_xfer_long(&off, 1, fw + bin, len, NULL);
++		}
++		if (err) {
++			return err;
++		}
++		sram += len;
++		bin += len;
++		size -= len;
++	}
++	return 0;
++}
++
++/* nvt_set_bld_crc_bank(), hw_crc > 1: destination, 4-byte length, golden CRC. */
++static int
++nvt_set_crc_bank(uint32_t des, uint32_t sram, uint32_t len_addr, uint32_t size, uint32_t g_csum, uint32_t crc)
++{
++	const uint8_t a[4] = {(uint8_t)(des & 0x7fu), (uint8_t)sram, (uint8_t)(sram >> 8), (uint8_t)(sram >> 16)};
++	const uint8_t b[4] = {(uint8_t)(len_addr & 0x7fu), (uint8_t)size, (uint8_t)(size >> 8), (uint8_t)((size >> 16) & 1u)};
++	const uint8_t c[5] = {(uint8_t)(g_csum & 0x7fu), (uint8_t)crc, (uint8_t)(crc >> 8), (uint8_t)(crc >> 16), (uint8_t)(crc >> 24)};
++	int err = nvt_set_page(des);
++	if (!err) {
++		err = nvt_write(a, 4);
++	}
++	if (!err) {
++		err = nvt_write(b, 4);
++	}
++	return err ? err : nvt_write(c, 5);
++}
++
++/* nvt_read_bld_hw_crc(): diagnostics after the last failed attempt. */
++static void
++nvt_crc_diag(const struct nvt_part *p)
++{
++	uint8_t flag = 0, g[4] = {0}, r[4] = {0}, gd[4] = {0}, rd[4] = {0};
++	if (nvt_set_page(NVT_G_ILM_CSUM) || nvt_read(NVT_BLD_ILM_DLM_CRC & 0x7fu, &flag, 1) ||
++	    nvt_read(NVT_G_ILM_CSUM & 0x7fu, g, 4) || nvt_read(NVT_R_ILM_CSUM & 0x7fu, r, 4) ||
++	    nvt_read(NVT_G_DLM_CSUM & 0x7fu, gd, 4) || nvt_read(NVT_R_DLM_CSUM & 0x7fu, rd, 4)) {
++		printf("ELISH TOUCH: 4 crc diag read failed\n");
++		return;
++	}
++	printf("ELISH TOUCH: 4 crc_done %u ilm_ok %u dlm_ok %u | ilm bin %08x golden %08x result %08x | dlm bin %08x golden %08x result %08x\n",
++	    (flag >> 2) & 1u, flag & 1u, (flag >> 1) & 1u, p[0].crc, nvt_le32(g), nvt_le32(r),
++	    p[1].crc, nvt_le32(gd), nvt_le32(rd));
++}
++
++static int
++nvt_download(const uint8_t *fw, unsigned fwsize)
++{
++	struct nvt_part p[NVT_MAX_PARTS];
++	unsigned count = 0, cascade = 0, bytes = 0;
++	int err = nvt_fw_parse(fw, fwsize, p, &count, &cascade);
++	if (err) {
++		printf("ELISH TOUCH: 4 firmware rejected (%d)\n", err);
++		return err;
++	}
++	for (unsigned n = 0; n < count; n++) {
++		bytes += p[n].size ? p[n].size + 1u : 0u;
++	}
++	printf("ELISH TOUCH: 4 firmware %u bytes, cascade %u, %u partitions, %u bytes to SRAM; ILM %06x+%x DLM %06x+%x\n",
++	    fwsize, cascade, count, bytes, p[0].sram, p[0].size, p[1].sram, p[1].size);
++	for (unsigned attempt = 0; attempt < 3 && !espi_dead; attempt++) {
++		uint64_t t0 = mach_absolute_time(), ns;
++		uint8_t v = 0, state[5] = {0};
++		err = nvt_write_addr(NVT_SWRST_N8, 0x69);       /* nvt_bootloader_reset */
++		delay(5000);
++		if (!err) {
++			err = nvt_write_addr(NVT_SPI_RD_FAST, 0x00);
++		}
++		if (!err) {
++			err = nvt_set_crc_bank(NVT_ILM_DES, p[0].sram, NVT_ILM_LENGTH, p[0].size, NVT_G_ILM_CSUM, p[0].crc);
++		}
++		if (!err) {
++			err = nvt_set_crc_bank(NVT_DLM_DES, p[1].sram, NVT_DLM_LENGTH, p[1].size, NVT_G_DLM_CSUM, p[1].crc);
++		}
++		if (!err && cascade) {
++			err = nvt_write_addr(NVT_TX_AUTO_COPY, 0x69);
++		}
++		for (unsigned n = 0; n < count && !err; n++) {
++			if (p[n].size) {
++				err = nvt_write_sram(fw, p[n].sram, p[n].size + 1u, p[n].bin);
++			}
++		}
++		if (!err && cascade) {                          /* nvt_check_spi_dma_tx_info */
++			unsigned i = 0;
++			for (; i < 200 && !err; i++) {
++				err = nvt_set_page(NVT_SPI_DMA_TX);
++				if (!err) {
++					err = nvt_read(NVT_SPI_DMA_TX & 0x7fu, &v, 1);
++				}
++				if (!err && v == 0) {
++					break;
++				}
++				delay(1000);
++			}
++			if (!err && i == 200) {
++				err = -20;
++			}
++		}
++		if (!err) {                                     /* nvt_bld_crc_enable */
++			err = nvt_set_page(NVT_BLD_CRC_EN);
++			if (!err) {
++				err = nvt_read(NVT_BLD_CRC_EN & 0x7fu, &v, 1);
++			}
++			if (!err) {
++				const uint8_t w[2] = {NVT_BLD_CRC_EN & 0x7fu, (uint8_t)(v | 0x80u)};
++				err = nvt_write(w, 2);
++			}
++		}
++		if (!err) {                                     /* nvt_fw_crc_enable */
++			const uint8_t clr[2] = {0x60, 0x00}, crc[2] = {0x50, 0xae};
++			err = nvt_set_page(NVT_EVENT_BUF);
++			if (!err) {
++				err = nvt_write(clr, 2);
++			}
++			if (!err) {
++				err = nvt_write(crc, 2);
++			}
++		}
++		if (!err) {                                     /* nvt_boot_ready */
++			err = nvt_write_addr(NVT_BOOT_RDY, 1);
++			delay(5000);
++		}
++		if (!err) {                                     /* nvt_check_fw_reset_state(INIT) */
++			err = nvt_set_page(NVT_EVENT_BUF | 0x60u);
++			for (unsigned i = 0; !err; i++) {
++				err = nvt_read(0x60, state, 5);
++				if (!err && state[0] >= 0xa0 && state[0] <= 0xaf) {
++					break;
++				}
++				if (i >= 10) {
++					err = -21;
++					break;
++				}
++				espi_sleep(10);
++			}
++		}
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		printf("ELISH TOUCH: 4 attempt %u err %d reset state %02x %02x %02x %02x %02x dma %02x, %llu ms\n",
++		    attempt, err, state[0], state[1], state[2], state[3], state[4], v, ns / 1000000u);
++		if (!err) {
++			return 0;
++		}
++	}
++	if (!espi_dead) {
++		nvt_crc_diag(p);
++	}
++	return err;
++}
++
++/* nvt_get_fw_info() and nvt_read_pid(). */
++static void
++nvt_fw_info(void)
++{
++	uint8_t b[38] = {0}, pid[2] = {0};
++	int err = nvt_set_page(NVT_EVENT_BUF | 0x78u);
++	if (!err) {
++		err = nvt_read(0x78, b, sizeof(b));
++	}
++	if (!err) {
++		err = nvt_set_page(NVT_EVENT_BUF | 0x9au);
++	}
++	if (!err) {
++		err = nvt_read(0x9a, pid, 2);
++	}
++	printf("ELISH TOUCH: 4 fw info err %d fw_ver %02x/%02x%s x_num %u y_num %u abs %ux%u buttons %u cascade %u PID %04x\n",
++	    err, b[0], b[1], ((b[0] + b[1]) & 0xff) == 0xff ? "" : " (broken)", b[2], b[3],
++	    (b[4] << 8) | b[5], (b[6] << 8) | b[7], b[10], b[33] & 1u, (pid[1] << 8) | pid[0]);
++}
++
+ static bool
+ espi_setup(vm_offset_t north, vm_offset_t south33, vm_offset_t south39)
+ {
+@@ -723,6 +1043,22 @@
+ 	}
+ 	printf("ELISH TOUCH: 3b result: %s\n", found ? "NT36523 identified over GENI SPI" :
+ 	    espi_dead ? "SE4 stopped" : "chip not identified");
++	uint32_t touch = 0;
++	PE_parse_boot_argn("elishtouch", &touch, sizeof(touch));
++	if (found && touch >= 3) {
++		DTEntry node;
++		void const *fw = NULL;
++		unsigned int fwsize = 0;
++		if (SecureDTLookupEntry(NULL, "/elish-touch", &node) != kSuccess ||
++		    SecureDTGetProperty(node, "firmware", &fw, &fwsize) != kSuccess || !fw) {
++			printf("ELISH TOUCH: 4 no /elish-touch firmware in the ADT (mkboot_elish.py --touch-fw); skip\n");
++		} else if (nvt_download((const uint8_t *)fw, fwsize) == 0) {
++			printf("ELISH TOUCH: 4 firmware download OK\n");
++			nvt_fw_info();
++		} else {
++			printf("ELISH TOUCH: 4 firmware download FAILED\n");
++		}
++	}
+ out:
+ 	printf("ELISH TOUCH: 3b done\n");
+ 	(void)thread_terminate(current_thread());
