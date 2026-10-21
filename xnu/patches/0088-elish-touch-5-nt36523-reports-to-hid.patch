@@ -1,0 +1,168 @@
+diff --git a/bsd/dev/sweet_pstore.c b/bsd/dev/sweet_pstore.c
+--- a/bsd/dev/sweet_pstore.c
++++ b/bsd/dev/sweet_pstore.c
+@@ -498,7 +498,8 @@
+ espi_xfer_long(const uint8_t *hdr, unsigned nh, const uint8_t *data, unsigned nd, uint8_t *rx)
+ {
+ 	unsigned n = nh + nd;
+-	if (espi_dead || n == 0 || n > 0x10000u || (rx && n > 64)) {
++	/* Longer reads stream too: GENI stops the clock at the RX RFR watermark. */
++	if (espi_dead || n == 0 || n > 0x10000u || (rx && n > 128)) {
+ 		return -1;
+ 	}
+ 	if (!espi_idle()) {
+@@ -611,7 +612,7 @@
+ static int
+ nvt_read(uint8_t off, uint8_t *out, unsigned n)
+ {
+-	uint8_t tx[64] = {(uint8_t)(off & 0x7fu)}, rx[64];
++	uint8_t tx[128] = {(uint8_t)(off & 0x7fu)}, rx[128];
+ 	if (n + 2 > sizeof(rx)) {
+ 		return -1;
+ 	}
+@@ -938,6 +939,135 @@
+ 	    (b[4] << 8) | b[5], (b[6] << 8) | b[7], b[10], b[33] & 1u, (pid[1] << 8) | pid[0]);
+ }
+ 
++/*
++ * Step 5 (elishtouch=4): touch reports -> SweetHID. nvt_ts_work_func():
++ * 65 bytes at EVENT_BUF offset 0; per finger 6 bytes at 6*i: id = b0 >> 3
++ * (1..10), b0 & 7 = 1 enter / 2 move, x = b1 << 4 | b3 >> 4,
++ * y = b2 << 4 | (b3 & 15) in 0..1600 x 0..2560; checksum byte 64
++ * (POINT_DATA_CHECKSUM); 77 77 77 77 77 77 = firmware recovery handshake.
++ * The IRQ line (gpio39, falling edge) is not routed to the GIC, so the
++ * buffer is polled every elishtouchpoll ms (default 8); an unchanged
++ * frame is harmless because only state changes reach HID.
++ * Coordinates: panel 1600x2560 -> presented 1125x2436 at panel (237, 62)
++ * (SweetFramebuffer.cpp fOffX/fOffY) -> SweetHID's sweet-panel input
++ * (1080x2400 inside 1125x2436 at (22, 18)): hid = panel - (259, 80), and
++ * SweetHID clamps, so the black border maps onto the display edge.
++ * Boot-arg elishtouchxf: bit0 mirror x, bit1 mirror y, bit2 swap axes.
++ */
++#define NVT_POINT_LEN   65u
++#define NVT_FINGERS     10u
++#define NVT_ABS_X       1600
++#define NVT_ABS_Y       2560
++
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++
++/* Returns -1 for a frame to skip, else a bitmask of fingers down. */
++static int
++nvt_decode(const uint8_t *d, uint32_t xf, int *hx, int *hy)
++{
++	uint8_t sum = 0;
++	for (unsigned i = 0; i < 64; i++) {
++		sum += d[i];
++	}
++	if ((uint8_t)(~sum + 1u) != d[64]) {
++		return -1;
++	}
++	if (d[0] == 0x77 && d[1] == 0x77 && d[2] == 0x77 && d[3] == 0x77 && d[4] == 0x77 && d[5] == 0x77) {
++		return -1;
++	}
++	int mask = 0;
++	for (unsigned i = 0; i < NVT_FINGERS; i++) {
++		const uint8_t *p = d + 6u * i;
++		unsigned id = p[0] >> 3, st = p[0] & 7u;
++		if (id == 0 || id > NVT_FINGERS || (st != 1 && st != 2) || (mask & (1 << (id - 1)))) {
++			continue;
++		}
++		int x = (p[1] << 4) | (p[3] >> 4), y = (p[2] << 4) | (p[3] & 15);
++		if (x > NVT_ABS_X || y > NVT_ABS_Y) {
++			continue;
++		}
++		if (xf & 4u) {
++			int t = x;
++			x = y * NVT_ABS_X / NVT_ABS_Y;
++			y = t * NVT_ABS_Y / NVT_ABS_X;
++		}
++		if (xf & 1u) {
++			x = NVT_ABS_X - x;
++		}
++		if (xf & 2u) {
++			y = NVT_ABS_Y - y;
++		}
++		hx[id - 1] = x - 259;
++		hy[id - 1] = y - 80;
++		mask |= 1 << (id - 1);
++	}
++	return mask;
++}
++
++static void
++nvt_touch_loop(vm_offset_t s39)
++{
++	unsigned irq_low = 0;
++	uint32_t xf = 0, poll = 8;
++	PE_parse_boot_argn("elishtouchxf", &xf, sizeof(xf));
++	PE_parse_boot_argn("elishtouchpoll", &poll, sizeof(poll));
++	if (poll < 2 || poll > 100) {
++		poll = 8;
++	}
++	int hx[NVT_FINGERS], hy[NVT_FINGERS], ox[NVT_FINGERS] = {0}, oy[NVT_FINGERS] = {0};
++	int down = 0, logged = 0;
++	unsigned frames = 0, bad = 0, errors = 0, ticks = 0;
++	printf("ELISH TOUCH: 5 polling every %u ms, xf %u -> SweetHID\n", poll, xf);
++	if (nvt_set_page(NVT_EVENT_BUF)) {
++		printf("ELISH TOUCH: 5 set page failed\n");
++		return;
++	}
++	while (!espi_dead) {
++		uint8_t d[NVT_POINT_LEN];
++		int err = nvt_read(0, d, NVT_POINT_LEN);
++		int mask = err ? -1 : nvt_decode(d, xf, hx, hy);
++		if (err) {
++			if ((errors++ % 100u) == 0) {
++				printf("ELISH TOUCH: 5 read err %d (%u)\n", err, errors);
++			}
++			(void)nvt_set_page(NVT_EVENT_BUF);
++		} else if (mask < 0) {
++			bad++;
++		} else {
++			frames++;
++			for (unsigned i = 0; i < NVT_FINGERS; i++) {
++				int bit = 1 << i;
++				if (mask & bit) {
++					if (!(down & bit) || hx[i] != ox[i] || hy[i] != oy[i]) {
++						if (!(down & bit) && logged < 40) {
++							logged++;
++							printf("ELISH TOUCH: 5 finger %u down raw-hid %d,%d\n", i, hx[i], hy[i]);
++						}
++						sweet_hid_touch((int)i, 1, hx[i], hy[i]);
++					}
++					ox[i] = hx[i];
++					oy[i] = hy[i];
++				} else if (down & bit) {
++					sweet_hid_touch((int)i, 0, ox[i], oy[i]);
++				}
++			}
++			down = mask;
++		}
++		irq_low += !(elish_rd(s39, 4) & 1u);
++		if (++ticks % (30000u / poll) == 0) {
++			printf("ELISH TOUCH: 5 alive polls %u frames %u bad %u errors %u down %x irq-low %u\n",
++			    ticks, frames, bad, errors, (unsigned)down, irq_low);
++		}
++		espi_sleep(poll);
++	}
++	for (unsigned i = 0; i < NVT_FINGERS; i++) {
++		if (down & (1 << i)) {
++			sweet_hid_touch((int)i, 0, ox[i], oy[i]);
++		}
++	}
++	printf("ELISH TOUCH: 5 stopped (SE4 dead)\n");
++}
++
+ static bool
+ espi_setup(vm_offset_t north, vm_offset_t south33, vm_offset_t south39)
+ {
+@@ -1055,6 +1185,9 @@
+ 		} else if (nvt_download((const uint8_t *)fw, fwsize) == 0) {
+ 			printf("ELISH TOUCH: 4 firmware download OK\n");
+ 			nvt_fw_info();
++			if (touch >= 4) {
++				nvt_touch_loop(s39);
++			}
+ 		} else {
+ 			printf("ELISH TOUCH: 4 firmware download FAILED\n");
+ 		}
